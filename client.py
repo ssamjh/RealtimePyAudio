@@ -9,7 +9,7 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 2
 RATE = 44100
 CHUNK = 1024
-BUFFER_SIZE = 20 * CHUNK
+BUFFER_SIZE = 1 * CHUNK
 
 # for logging
 logging.basicConfig(level=logging.DEBUG)
@@ -27,7 +27,7 @@ def connect_to_server():
             client_socket.connect(("10.60.122.12", 4444))
             return client_socket
         except socket.error:
-            logger.debug("Connection lost, retrying in 0.5s...")
+            logger.debug("Connection lost, retrying...")
             time.sleep(0.5)
 
 
@@ -77,5 +77,4 @@ while True:
             stream.close()
         except OSError:
             logger.debug("Stream already closed")
-        time.sleep(0.5)
         continue
