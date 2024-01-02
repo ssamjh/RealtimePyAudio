@@ -7,9 +7,9 @@ import os
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
-RATE = 44100
+RATE = 48000
 CHUNK = 1024
-BUFFER_SIZE = 16 * CHUNK
+BUFFER_SIZE = 8 * CHUNK
 
 # for logging
 logging.basicConfig(level=logging.DEBUG)
@@ -32,18 +32,9 @@ def connect_to_server(server_config):
             time.sleep(5)
 
 
-def find_device_index_by_name(audio, device_name):
-    for i in range(audio.get_device_count()):
-        device_info = audio.get_device_info_by_index(i)
-        if device_name == device_info.get('name'):
-            return i
-    raise Exception('Device not found')
-
-
-def open_stream(audio, device_name):
-    device_id = find_device_index_by_name(audio, device_name)
-    return audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True, output_device_index=device_id,
-                      frames_per_buffer=BUFFER_SIZE)
+def open_stream(audio, device_id):
+    return audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True,
+                      output_device_index=device_id, frames_per_buffer=BUFFER_SIZE)
 
 
 audio = pyaudio.PyAudio()
@@ -53,22 +44,27 @@ while True:
         if config is None:
             # List all audio output devices
             logger.debug("Available audio output devices:")
+            device_ids = []
             for i in range(audio.get_device_count()):
                 device_info = audio.get_device_info_by_index(i)
                 if device_info["maxOutputChannels"] > 0:
+                    device_ids.append(device_info['index'])
                     logger.debug(
                         f"ID: {device_info['index']}, Name: {device_info['name']}")
-            device_name = input(
-                "Please enter the name of the audio output device to use: ")
+            device_id = int(
+                input("Please enter the ID of the audio output device to use: "))
+            if device_id not in device_ids:
+                logger.debug("Invalid device ID")
+                continue
             ip = input("Please enter the server IP to use: ")
             port = int(
                 input("Please enter the server port to use (default is 12998): ") or "12998")
-            config = {"device_name": device_name, "ip": ip, "port": port}
+            config = {"device_id": device_id, "ip": ip, "port": port}
             pickle.dump(config, open(config_file, "wb"))
         else:
             logger.debug(f"Using saved config: {config}")
 
-        stream = open_stream(audio, config['device_name'])
+        stream = open_stream(audio, config['device_id'])
 
         client_socket = connect_to_server(config)
 

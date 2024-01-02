@@ -6,21 +6,12 @@ import os
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
-RATE = 44100
+RATE = 48000
 CHUNK = 1024
 
 # for logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-
-
-def find_device_index_by_name(audio, device_name):
-    for i in range(audio.get_device_count()):
-        device_info = audio.get_device_info_by_index(i)
-        if device_name == device_info.get('name'):
-            return i
-    raise Exception('Device not found')
-
 
 config_file = "config-server.pkl"
 config = None if not os.path.exists(
@@ -33,24 +24,31 @@ server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 if config is None:
     # List all audio input devices
     logger.debug("Available audio input devices:")
+    device_ids = []
     for i in range(audio.get_device_count()):
         device_info = audio.get_device_info_by_index(i)
         if device_info["maxInputChannels"] > 0:
+            device_ids.append(device_info['index'])
             logger.debug(
                 f"ID: {device_info['index']}, Name: {device_info['name']}")
-    device_name = input(
-        "Please enter the name of the audio input device to use: ")
+
+    # Get the device id from the user and ensure it is a valid id
+    device_id = None
+    while device_id is None or device_id not in device_ids:
+        device_id = int(
+            input("Please enter the ID of the audio input device to use: "))
+        if device_id not in device_ids:
+            logger.debug("Invalid device ID")
+
     port = int(
         input("Please enter the server port to use (default is 12998): ") or "12998")
-    config = {"name": device_name, "port": port}
+    config = {"id": device_id, "port": port}
     pickle.dump(config, open(config_file, "wb"))
 else:
     logger.debug(f"Using saved config: {config}")
 
-device_id = find_device_index_by_name(audio, config.get('name'))
-
 stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                    input=True, frames_per_buffer=CHUNK, input_device_index=device_id)
+                    input=True, frames_per_buffer=CHUNK, input_device_index=config.get('id'))
 
 try:
     server_socket.bind(("", config['port']))
@@ -61,7 +59,7 @@ try:
         try:
             conn, addr = server_socket.accept()
             logger.debug(f"Connection from: {addr}")
-            logger.debug(f"Device used: {config['name']}")
+            logger.debug(f"Device used: {config['id']}")
             logger.debug("Streaming audio...")
 
             while True:
