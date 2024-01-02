@@ -1,45 +1,72 @@
+import pyaudio
 import socket
-import sounddevice as sd
-import pickle
+import time
 import logging
+import pickle
+import os
 
-logging.basicConfig(filename='client.log', level=logging.DEBUG)
+FORMAT = pyaudio.paInt16
+CHANNELS = 2
+RATE = 44100
+CHUNK = 1024
+BUFFER_SIZE = 20 * CHUNK
+
+# for logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+audio = pyaudio.PyAudio()
+
+device_id_file = "client_device_id.pkl"
+device_id = None if not os.path.exists(
+    device_id_file) else pickle.load(open(device_id_file, "rb"))
+
+if device_id is None:
+    # List all audio output devices
+    logger.debug("Available audio output devices:")
+    for i in range(audio.get_device_count()):
+        device_info = audio.get_device_info_by_index(i)
+        if device_info["maxOutputChannels"] > 0:
+            logger.debug(
+                f"ID: {device_info['index']}, Name: {device_info['name']}")
+    device_id = int(
+        input("Please enter the ID of the audio output device to use: "))
+    pickle.dump(device_id, open(device_id_file, "wb"))
+else:
+    logger.debug(f"Using saved audio output device with ID: {device_id}")
+
+stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True, output_device_index=device_id,
+                    frames_per_buffer=BUFFER_SIZE)
 
 
-class Client:
-    def __init__(self, device_name):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def connect_to_server():
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    while True:
+        try:
+            client_socket.connect(("10.60.122.12", 4444))
+            return client_socket
+        except socket.error:
+            logger.debug("Connection lost, retrying in 5 seconds...")
+            time.sleep(5)
 
-        self.device_id = None
-        self.device_name = device_name
 
-    def setup_sound_card(self):
-        devices = sd.query_devices()
-        for device in devices:
-            if self.device_name in device['name']:
-                self.device_id = device['device']
-                logging.info(f'Set sound card: {device["name"]}')
+client_socket = connect_to_server()
 
-    def start(self, host, port):
-        self.setup_sound_card()
+try:
+    while True:
+        try:
+            data = b''
+            while len(data) < CHUNK:
+                packet = client_socket.recv(CHUNK - len(data))
+                if not packet:
+                    break
+                data += packet
+            stream.write(data, exception_on_underflow=True)
+        except (OSError, IOError) as e:
+            logger.error(f"Buffer Error: {e}")
 
-        self.sock.connect((host, port))
-        logging.debug(f'Connected to server at {host}:{port}')
-
-        stream = sd.OutputStream(device=self.device_id)
-        stream.start()
-
-        while True:
-            data = self.sock.recv(4096)
-            if not data:
-                logging.warning('Connection dropped. Reconnecting...')
-                self.sock.connect((host, port))
-
-            try:
-                # Assuming the server is periodically sending audio packets
-                audio_data = pickle.loads(data)
-                stream.write(audio_data)
-            except (pickle.UnpicklingError, EOFError):
-                logging.warning(
-                    'Corrupted packet received. Requesting retransmission...')
-                # Send your retransmission request here
+finally:
+    stream.stop_stream()
+    stream.close()
+    audio.terminate()
+    client_socket.close()
