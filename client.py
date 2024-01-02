@@ -15,28 +15,9 @@ BUFFER_SIZE = 20 * CHUNK
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-audio = pyaudio.PyAudio()
-
 device_id_file = "client_device_id.pkl"
 device_id = None if not os.path.exists(
     device_id_file) else pickle.load(open(device_id_file, "rb"))
-
-if device_id is None:
-    # List all audio output devices
-    logger.debug("Available audio output devices:")
-    for i in range(audio.get_device_count()):
-        device_info = audio.get_device_info_by_index(i)
-        if device_info["maxOutputChannels"] > 0:
-            logger.debug(
-                f"ID: {device_info['index']}, Name: {device_info['name']}")
-    device_id = int(
-        input("Please enter the ID of the audio output device to use: "))
-    pickle.dump(device_id, open(device_id_file, "wb"))
-else:
-    logger.debug(f"Using saved audio output device with ID: {device_id}")
-
-stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True, output_device_index=device_id,
-                    frames_per_buffer=BUFFER_SIZE)
 
 
 def connect_to_server():
@@ -46,27 +27,55 @@ def connect_to_server():
             client_socket.connect(("10.60.122.12", 4444))
             return client_socket
         except socket.error:
-            logger.debug("Connection lost, retrying in 5 seconds...")
-            time.sleep(5)
+            logger.debug("Connection lost, retrying in 0.5s...")
+            time.sleep(0.5)
 
 
-client_socket = connect_to_server()
+def open_stream(audio):
+    return audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True, output_device_index=device_id,
+                      frames_per_buffer=BUFFER_SIZE)
 
-try:
-    while True:
-        try:
+
+audio = pyaudio.PyAudio()
+
+while True:
+    try:
+        if device_id is None:
+            # List all audio output devices
+            logger.debug("Available audio output devices:")
+            for i in range(audio.get_device_count()):
+                device_info = audio.get_device_info_by_index(i)
+                if device_info["maxOutputChannels"] > 0:
+                    logger.debug(
+                        f"ID: {device_info['index']}, Name: {device_info['name']}")
+            device_id = int(
+                input("Please enter the ID of the audio output device to use: "))
+            pickle.dump(device_id, open(device_id_file, "wb"))
+        else:
+            logger.debug(
+                f"Using saved audio output device with ID: {device_id}")
+
+        stream = open_stream(audio)
+
+        client_socket = connect_to_server()
+
+        while True:
             data = b''
             while len(data) < CHUNK:
                 packet = client_socket.recv(CHUNK - len(data))
                 if not packet:
                     break
                 data += packet
-            stream.write(data, exception_on_underflow=True)
-        except (OSError, IOError) as e:
-            logger.error(f"Buffer Error: {e}")
 
-finally:
-    stream.stop_stream()
-    stream.close()
-    audio.terminate()
-    client_socket.close()
+            stream.write(data, exception_on_underflow=True)
+
+    except (OSError, IOError) as e:
+        logger.error(f"Buffer Error: {e}")
+        client_socket.close()
+        try:
+            stream.stop_stream()
+            stream.close()
+        except OSError:
+            logger.debug("Stream already closed")
+        time.sleep(0.5)
+        continue
