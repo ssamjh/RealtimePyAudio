@@ -7,7 +7,7 @@ import os
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
 RATE = 48000
-CHUNK = 2 * 1024
+CHUNK = 1024
 
 # for logging
 logging.basicConfig(level=logging.DEBUG)
