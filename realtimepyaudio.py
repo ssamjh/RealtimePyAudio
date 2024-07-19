@@ -8,6 +8,7 @@ import os
 import select
 import threading
 import struct
+from collections import deque
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
@@ -15,6 +16,9 @@ RATE = 44100
 CHUNK = 4096
 BUFFER_SIZE = 1 * CHUNK
 KEEP_ALIVE_INTERVAL = 5
+MAX_RETRIES = 3
+PACKET_HEADER_SIZE = 8  # 4 bytes for sequence number, 4 bytes for payload size
+BUFFER_DURATION = 5  # Buffer duration in seconds
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -52,6 +56,10 @@ def get_config(config_file, is_server):
                 input("Please enter the server port to use (default is 12998): ")
                 or "12998"
             )
+        if "retransmit" not in config:
+            config["retransmit"] = (
+                input("Enable retransmission? (y/n): ").lower() == "y"
+            )
     else:
         if "device_id" not in config:
             logger.debug("Available audio output devices:")
@@ -74,17 +82,33 @@ def get_config(config_file, is_server):
     return config
 
 
+def pack_audio_data(seq_num, audio_data):
+    header = struct.pack(">II", seq_num, len(audio_data))
+    return header + audio_data
+
+
+def unpack_audio_data(packet):
+    header = packet[:PACKET_HEADER_SIZE]
+    seq_num, payload_size = struct.unpack(">II", header)
+    return seq_num, packet[PACKET_HEADER_SIZE:]
+
+
 def run_server(config):
     audio = pyaudio.PyAudio()
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     def audio_stream_thread(conn, stream, stop_event):
+        seq_num = 0
+        conn.setblocking(0)  # Set to non-blocking mode
         try:
             while not stop_event.is_set():
                 try:
                     data = stream.read(CHUNK, exception_on_overflow=False)
-                    conn.sendall(data)
+                    packet = pack_audio_data(seq_num, data)
+                    conn.sendall(packet)
+                    seq_num = (seq_num + 1) % (2**32)  # Wrap around at 2^32
+
                     if config["debugging"]:
                         if len(data) < CHUNK:
                             logger.debug(
@@ -92,7 +116,12 @@ def run_server(config):
                             )
                 except IOError as e:
                     if config["debugging"] and not stop_event.is_set():
-                        logger.debug(f"Audio input error: {e}")
+                        if e.errno != 10035:  # Not a "would block" error
+                            logger.debug(f"Audio input error: {e}")
+                except socket.error as e:
+                    if e.errno != 10035:  # Not a "would block" error
+                        logger.error(f"Socket error: {e}")
+                        break
                 except Exception as e:
                     if not stop_event.is_set():
                         logger.error(f"Audio streaming error: {e}")
@@ -195,6 +224,16 @@ def run_client(config):
             except:
                 break
 
+    def audio_playback_thread(buffer, stop_event, playback_ready):
+        playback_ready.wait()  # Wait until the buffer is filled
+        logger.debug("Starting audio playback")
+        while not stop_event.is_set():
+            if len(buffer) > 0:
+                audio_data = buffer.popleft()
+                stream.write(audio_data)
+            else:
+                time.sleep(0.01)  # Short sleep to prevent busy-waiting
+
     while True:
         try:
             client_socket = connect_to_server(config)
@@ -204,24 +243,70 @@ def run_client(config):
                 target=keep_alive_thread, args=(client_socket,), daemon=True
             ).start()
 
+            expected_seq_num = 0
+            buffer = deque()
+            packet_buffer = {}
+            buffer_samples = int(BUFFER_DURATION * RATE / CHUNK)
+            stop_event = threading.Event()
+            playback_ready = threading.Event()
+
+            playback_thread = threading.Thread(
+                target=audio_playback_thread,
+                args=(buffer, stop_event, playback_ready),
+                daemon=True,
+            )
+            playback_thread.start()
+
+            logger.debug(f"Buffering audio for {BUFFER_DURATION} seconds...")
+
             while True:
-                data = client_socket.recv(CHUNK)
-                if not data:
+                header = client_socket.recv(PACKET_HEADER_SIZE)
+                if not header:
                     raise ConnectionResetError("Server disconnected")
+
+                seq_num, payload_size = struct.unpack(">II", header)
+
+                # Receive the audio data
+                audio_data = b""
+                while len(audio_data) < payload_size:
+                    chunk = client_socket.recv(payload_size - len(audio_data))
+                    if not chunk:
+                        raise ConnectionResetError("Server disconnected")
+                    audio_data += chunk
+
+                # Store the packet in the buffer
+                packet_buffer[seq_num] = audio_data
+
+                # Process packets in order
+                while expected_seq_num in packet_buffer:
+                    buffer.append(packet_buffer.pop(expected_seq_num))
+                    expected_seq_num = (expected_seq_num + 1) % (2**32)
+
+                    # Check if buffer is filled
+                    if not playback_ready.is_set() and len(buffer) >= buffer_samples:
+                        playback_ready.set()
+                        logger.debug("Buffer filled, starting playback")
+
+                    # Trim buffer if it exceeds the desired duration
+                    while len(buffer) > buffer_samples:
+                        buffer.popleft()
+
+                # Clean up old packets
+                for seq in list(packet_buffer.keys()):
+                    if (seq - expected_seq_num) % (2**32) > 1000:  # Arbitrary threshold
+                        del packet_buffer[seq]
+
                 if config["debugging"]:
-                    if len(data) < CHUNK:
+                    if len(audio_data) < CHUNK:
                         logger.debug(
-                            f"Network dropout detected. Expected {CHUNK} bytes, got {len(data)} bytes."
+                            f"Network dropout detected. Expected {CHUNK} bytes, got {len(audio_data)} bytes."
                         )
-                try:
-                    stream.write(data)
-                except IOError as e:
-                    if config["debugging"]:
-                        logger.debug(f"Audio output error: {e}")
 
         except (OSError, IOError, ConnectionResetError) as e:
             logger.error(f"Connection Error: {e}")
             client_socket.close()
+            stop_event.set()
+            playback_thread.join(timeout=1)
             stream.stop_stream()
             stream.close()
             time.sleep(5)  # Wait before attempting to reconnect
