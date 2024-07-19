@@ -7,6 +7,7 @@ import pickle
 import os
 import select
 import threading
+import struct
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
@@ -33,30 +34,41 @@ def get_available_devices(audio, is_input):
 
 def get_config(config_file, is_server):
     if os.path.exists(config_file):
-        return pickle.load(open(config_file, "rb"))
+        config = pickle.load(open(config_file, "rb"))
+    else:
+        config = {}
 
-    config = {}
     audio = pyaudio.PyAudio()
 
     if is_server:
-        logger.debug("Available audio input devices:")
-        device_ids = get_available_devices(audio, True)
-        config["id"] = int(
-            input("Please enter the ID of the audio input device to use: ")
-        )
-        config["port"] = int(
-            input("Please enter the server port to use (default is 12998): ") or "12998"
-        )
+        if "id" not in config:
+            logger.debug("Available audio input devices:")
+            device_ids = get_available_devices(audio, True)
+            config["id"] = int(
+                input("Please enter the ID of the audio input device to use: ")
+            )
+        if "port" not in config:
+            config["port"] = int(
+                input("Please enter the server port to use (default is 12998): ")
+                or "12998"
+            )
     else:
-        logger.debug("Available audio output devices:")
-        device_ids = get_available_devices(audio, False)
-        config["device_id"] = int(
-            input("Please enter the ID of the audio output device to use: ")
-        )
-        config["ip"] = input("Please enter the server IP to use: ")
-        config["port"] = int(
-            input("Please enter the server port to use (default is 12998): ") or "12998"
-        )
+        if "device_id" not in config:
+            logger.debug("Available audio output devices:")
+            device_ids = get_available_devices(audio, False)
+            config["device_id"] = int(
+                input("Please enter the ID of the audio output device to use: ")
+            )
+        if "ip" not in config:
+            config["ip"] = input("Please enter the server IP to use: ")
+        if "port" not in config:
+            config["port"] = int(
+                input("Please enter the server port to use (default is 12998): ")
+                or "12998"
+            )
+
+    if "debugging" not in config:
+        config["debugging"] = input("Enable debugging? (y/n): ").lower() == "y"
 
     pickle.dump(config, open(config_file, "wb"))
     return config
@@ -67,13 +79,27 @@ def run_server(config):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    def audio_stream_thread(conn, stream):
+    def audio_stream_thread(conn, stream, stop_event):
         try:
-            while True:
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                conn.sendall(data)
+            while not stop_event.is_set():
+                try:
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    conn.sendall(data)
+                    if config["debugging"]:
+                        if len(data) < CHUNK:
+                            logger.debug(
+                                f"Audio input dropout detected. Expected {CHUNK} bytes, got {len(data)} bytes."
+                            )
+                except IOError as e:
+                    if config["debugging"] and not stop_event.is_set():
+                        logger.debug(f"Audio input error: {e}")
+                except Exception as e:
+                    if not stop_event.is_set():
+                        logger.error(f"Audio streaming error: {e}")
+                    break
         except Exception as e:
-            logger.error(f"Audio streaming error: {e}")
+            if not stop_event.is_set():
+                logger.error(f"Audio streaming thread error: {e}")
 
     try:
         server_socket.bind(("", config["port"]))
@@ -95,39 +121,43 @@ def run_server(config):
                 input_device_index=config["id"],
             )
 
-            # Start audio streaming in a separate thread
-            threading.Thread(
-                target=audio_stream_thread, args=(conn, stream), daemon=True
-            ).start()
+            stop_event = threading.Event()
+            audio_thread = threading.Thread(
+                target=audio_stream_thread, args=(conn, stream, stop_event), daemon=True
+            )
+            audio_thread.start()
 
             last_keep_alive = time.time()
             conn.setblocking(0)
 
-            while True:
-                ready = select.select([conn], [], [], 0.1)
-                if ready[0]:
-                    try:
-                        data = conn.recv(1024)
-                        if not data:
-                            raise ConnectionResetError("Client disconnected")
-                        if data == b"KEEP_ALIVE":
-                            last_keep_alive = time.time()
-                    except ConnectionResetError:
-                        logger.debug("Client disconnected")
-                        break
+            try:
+                while True:
+                    ready = select.select([conn], [], [], 0.1)
+                    if ready[0]:
+                        try:
+                            data = conn.recv(1024)
+                            if not data:
+                                raise ConnectionResetError("Client disconnected")
+                            if data == b"KEEP_ALIVE":
+                                last_keep_alive = time.time()
+                        except ConnectionResetError:
+                            logger.debug("Client disconnected")
+                            break
 
-                if time.time() - last_keep_alive > KEEP_ALIVE_INTERVAL * 2:
-                    logger.debug("Keep-alive timeout, closing connection")
-                    break
+                    if time.time() - last_keep_alive > KEEP_ALIVE_INTERVAL * 2:
+                        logger.debug("Keep-alive timeout, closing connection")
+                        break
+            finally:
+                stop_event.set()  # Signal the audio thread to stop
+                conn.close()
+                stream.stop_stream()
+                stream.close()
+                audio_thread.join(timeout=1)  # Wait for the audio thread to finish
+                logger.debug("Connection closed and audio stream stopped")
 
     except Exception as e:
-        logger.error(f"Error occurred: {e}")
+        logger.error(f"Server error occurred: {e}")
     finally:
-        if "conn" in locals():
-            conn.close()
-        if "stream" in locals():
-            stream.stop_stream()
-            stream.close()
         audio.terminate()
         server_socket.close()
         logger.debug("Server stopped. Restarting...")
@@ -170,7 +200,6 @@ def run_client(config):
             client_socket = connect_to_server(config)
             client_socket.setblocking(1)  # Set socket to blocking mode
 
-            # Start keep-alive in a separate thread
             threading.Thread(
                 target=keep_alive_thread, args=(client_socket,), daemon=True
             ).start()
@@ -179,7 +208,16 @@ def run_client(config):
                 data = client_socket.recv(CHUNK)
                 if not data:
                     raise ConnectionResetError("Server disconnected")
-                stream.write(data)
+                if config["debugging"]:
+                    if len(data) < CHUNK:
+                        logger.debug(
+                            f"Network dropout detected. Expected {CHUNK} bytes, got {len(data)} bytes."
+                        )
+                try:
+                    stream.write(data)
+                except IOError as e:
+                    if config["debugging"]:
+                        logger.debug(f"Audio output error: {e}")
 
         except (OSError, IOError, ConnectionResetError) as e:
             logger.error(f"Connection Error: {e}")
